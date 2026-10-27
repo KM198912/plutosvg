@@ -20,7 +20,7 @@ const char* plutosvg_version_string(void)
 enum {
     TAG_UNKNOWN = 0,
     TAG_CIRCLE,
-    TAG_CLIP_PATH, // TODO
+    TAG_CLIP_PATH,
     TAG_DEFS,
     TAG_ELLIPSE,
     TAG_G,
@@ -1535,6 +1535,7 @@ typedef struct render_state {
     struct render_state* parent;
     const element_t* element;
     render_mode_t mode;
+    bool clipped;
     float opacity;
 
     float view_width;
@@ -1550,11 +1551,25 @@ typedef struct render_state {
 #define IS_INVALID_RECT(rect) ((rect).w < 0 || (rect).h < 0)
 #define IS_EMPTY_RECT(rect) ((rect).w <= 0 || (rect).h <= 0)
 
-static void render_state_begin(const element_t* element, render_state_t* state, render_state_t* parent)
+typedef struct {
+    const plutosvg_document_t* document;
+    plutovg_canvas_t* canvas;
+    const plutovg_color_t* current_color;
+    plutosvg_palette_func_t palette_func;
+    void* closure;
+    int depth;
+    plutovg_path_t* clip_path;
+    plutovg_fill_rule_t clip_rule;
+} render_context_t;
+
+static bool apply_clip_path(const element_t* element, render_context_t* context, render_state_t* state);
+
+static void render_state_begin(const element_t* element, render_context_t* context, render_state_t* state, render_state_t* parent)
 {
     state->parent = parent;
     state->element = element;
     state->mode = parent->mode;
+    state->clipped = false;
     state->opacity = parent->opacity;
     state->matrix = parent->matrix;
     state->extents = INVALID_RECT;
@@ -1568,11 +1583,15 @@ static void render_state_begin(const element_t* element, render_state_t* state, 
         if(parse_number(element, ATTR_OPACITY, &state->opacity, true, false)) {
             state->opacity *= parent->opacity;
         }
+
+        state->clipped = apply_clip_path(element, context, state);
     }
 }
 
-static void render_state_end(render_state_t* state)
+static void render_state_end(render_context_t* context, render_state_t* state)
 {
+    if(state->clipped)
+        plutovg_canvas_restore(context->canvas);
     if(state->mode == render_mode_painting)
         return;
     if(IS_INVALID_RECT(state->extents)) {
@@ -1611,15 +1630,6 @@ static bool has_cycle_reference(const render_state_t* state, const element_t* el
     return false;
 }
 
-typedef struct {
-    const plutosvg_document_t* document;
-    plutovg_canvas_t* canvas;
-    const plutovg_color_t* current_color;
-    plutosvg_palette_func_t palette_func;
-    void* closure;
-    int depth;
-} render_context_t;
-
 static float resolve_length(const render_state_t* state, const length_t* length, char mode)
 {
     float maximum = 0.f;
@@ -1652,6 +1662,104 @@ static element_t* resolve_href(const plutosvg_document_t* document, const elemen
     }
 
     return NULL;
+}
+
+static void render_element(const element_t* element, render_context_t* context, render_state_t* state);
+static void render_children(const element_t* element, render_context_t* context, render_state_t* state);
+
+static void element_bounding_box(const element_t* element, render_context_t* context, const render_state_t* state, plutovg_rect_t* bbox)
+{
+    render_state_t root;
+    root.parent = NULL;
+    root.element = NULL;
+    root.mode = render_mode_bounding;
+    root.clipped = false;
+    root.opacity = 1.f;
+    root.extents = INVALID_RECT;
+    root.view_width = state->view_width;
+    root.view_height = state->view_height;
+    plutovg_matrix_init_identity(&root.matrix);
+
+    render_context_t bounding = *context;
+    bounding.canvas = NULL;
+    render_element(element, &bounding, &root);
+    if(IS_INVALID_RECT(root.extents)) {
+        *bbox = EMPTY_RECT;
+        return;
+    }
+
+    // The pass measured the element in its parent's space; the bounding box is in its own
+    plutovg_matrix_t transform;
+    if(element->parent && parse_transform(element, ATTR_TRANSFORM, &transform)) {
+        plutovg_matrix_t inverse;
+        if(plutovg_matrix_invert(&transform, &inverse)) {
+            plutovg_matrix_map_rect(&inverse, &root.extents, bbox);
+            return;
+        }
+    }
+
+    *bbox = root.extents;
+}
+
+static bool apply_clip_path(const element_t* element, render_context_t* context, render_state_t* state)
+{
+    const string_t* value = find_attribute(element, ATTR_CLIP_PATH, false);
+    if(value == NULL)
+        return false;
+    const char* it = value->data;
+    const char* end = it + value->length;
+    string_t id;
+    if(!parse_url_value(&it, end, &id))
+        return false;
+    const element_t* ref = find_element(context->document, &id);
+    if(ref == NULL || ref->id != TAG_CLIP_PATH || has_cycle_reference(state, ref))
+        return false;
+
+    render_state_t clip_state;
+    clip_state.parent = state;
+    clip_state.element = ref;
+    clip_state.mode = render_mode_clipping;
+    clip_state.clipped = false;
+    clip_state.opacity = 1.f;
+    clip_state.extents = INVALID_RECT;
+    clip_state.view_width = state->view_width;
+    clip_state.view_height = state->view_height;
+    clip_state.matrix = state->matrix;
+
+    units_type_t units = units_type_user_space_on_use;
+    parse_units_type(ref, ATTR_CLIP_PATH_UNITS, &units);
+    if(units == units_type_object_bounding_box) {
+        plutovg_rect_t bbox;
+        element_bounding_box(element, context, state, &bbox);
+        plutovg_matrix_translate(&clip_state.matrix, bbox.x, bbox.y);
+        plutovg_matrix_scale(&clip_state.matrix, bbox.w, bbox.h);
+        clip_state.view_width = 1.f;
+        clip_state.view_height = 1.f;
+    }
+
+    plutovg_matrix_t transform;
+    if(parse_transform(ref, ATTR_TRANSFORM, &transform))
+        plutovg_matrix_multiply(&clip_state.matrix, &transform, &clip_state.matrix);
+
+    // The children's geometry, in device space, into one path (draw_shape in clipping mode)
+    plutovg_path_t* saved_path = context->clip_path;
+    plutovg_fill_rule_t saved_rule = context->clip_rule;
+    plutovg_path_t* path = plutovg_path_create();
+    context->clip_path = path;
+    context->clip_rule = PLUTOVG_FILL_RULE_NON_ZERO;
+    render_children(ref, context, &clip_state);
+
+    plutovg_matrix_t identity;
+    plutovg_matrix_init_identity(&identity);
+    plutovg_canvas_save(context->canvas);
+    plutovg_canvas_set_matrix(context->canvas, &identity);
+    plutovg_canvas_set_fill_rule(context->canvas, context->clip_rule);
+    plutovg_canvas_clip_path(context->canvas, path);
+
+    plutovg_path_destroy(path);
+    context->clip_path = saved_path;
+    context->clip_rule = saved_rule;
+    return true;
 }
 
 static plutovg_color_t convert_color(const color_t* color)
@@ -1952,6 +2060,12 @@ static bool apply_paint(render_state_t* state, render_context_t* context, const 
 
 static void draw_shape(const element_t* element, render_context_t* context, render_state_t* state)
 {
+    if(state->mode == render_mode_clipping) {
+        parse_fill_rule(element, ATTR_CLIP_RULE, &context->clip_rule);
+        plutovg_path_add_path(context->clip_path, context->document->path, &state->matrix);
+        return;
+    }
+
     paint_t stroke = {paint_type_none};
     parse_paint(element, ATTR_STROKE, &stroke);
 
@@ -2109,7 +2223,7 @@ static void render_symbol(const element_t* element, render_context_t* context, r
     if(width <= 0.f || height <= 0.f || is_display_none(element))
         return;
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.view_width = width;
     new_state.view_height = height;
@@ -2117,7 +2231,7 @@ static void render_symbol(const element_t* element, render_context_t* context, r
 
     apply_view_transform(&new_state, width, height);
     render_children(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_svg(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2162,7 +2276,7 @@ static void render_use(const element_t* element, render_context_t* context, rend
     float _y = resolve_length(state, &y, 'y');
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
     plutovg_matrix_translate(&new_state.matrix, _x, _y);
 
     const element_t* parent = ref->parent;
@@ -2174,7 +2288,7 @@ static void render_use(const element_t* element, render_context_t* context, rend
     }
 
     ref->parent = (element_t*)(parent);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_g(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2182,9 +2296,9 @@ static void render_g(const element_t* element, render_context_t* context, render
     if(is_display_none(element))
         return;
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
     render_children(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_line(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2207,7 +2321,7 @@ static void render_line(const element_t* element, render_context_t* context, ren
     float _y2 = resolve_length(state, &y2, 'y');
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.extents.x = MIN(_x1, _x2);
     new_state.extents.y = MIN(_y1, _y2);
@@ -2218,7 +2332,7 @@ static void render_line(const element_t* element, render_context_t* context, ren
     plutovg_path_move_to(context->document->path, _x1, _y1);
     plutovg_path_line_to(context->document->path, _x2, _y2);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_ellipse(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2244,7 +2358,7 @@ static void render_ellipse(const element_t* element, render_context_t* context, 
     float _ry = resolve_length(state, &ry, 'y');
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.extents.x = _cx - _rx;
     new_state.extents.y = _cy - _ry;
@@ -2254,7 +2368,7 @@ static void render_ellipse(const element_t* element, render_context_t* context, 
     plutovg_path_reset(context->document->path);
     plutovg_path_add_ellipse(context->document->path, _cx, _cy, _rx, _ry);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_circle(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2276,7 +2390,7 @@ static void render_circle(const element_t* element, render_context_t* context, r
     float _r = resolve_length(state, &r, 'o');
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.extents.x = _cx - _r;
     new_state.extents.y = _cy - _r;
@@ -2286,7 +2400,7 @@ static void render_circle(const element_t* element, render_context_t* context, r
     plutovg_path_reset(context->document->path);
     plutovg_path_add_circle(context->document->path, _cx, _cy, _r);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_rect(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2324,7 +2438,7 @@ static void render_rect(const element_t* element, render_context_t* context, ren
     if(!is_length_valid(ry)) _ry = _rx;
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.extents.x = _x;
     new_state.extents.y = _y;
@@ -2334,7 +2448,7 @@ static void render_rect(const element_t* element, render_context_t* context, ren
     plutovg_path_reset(context->document->path);
     plutovg_path_add_round_rect(context->document->path, _x, _y, _w, _h, _rx, _ry);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_poly(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2342,13 +2456,13 @@ static void render_poly(const element_t* element, render_context_t* context, ren
     if(is_display_none(element) || is_visibility_hidden(element))
         return;
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     plutovg_path_reset(context->document->path);
     parse_points(element, ATTR_POINTS, context->document->path);
     plutovg_path_extents(context->document->path, &new_state.extents, false);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_path(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2356,13 +2470,13 @@ static void render_path(const element_t* element, render_context_t* context, ren
     if(is_display_none(element) || is_visibility_hidden(element))
         return;
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     plutovg_path_reset(context->document->path);
     parse_path(element, ATTR_D, context->document->path);
     plutovg_path_extents(context->document->path, &new_state.extents, false);
     draw_shape(element, context, &new_state);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void transform_view_rect(const view_position_t* position, plutovg_rect_t* dst_rect, plutovg_rect_t* src_rect)
@@ -2470,7 +2584,7 @@ static plutovg_surface_t* load_image(const element_t* element)
 
 static void draw_image(const element_t* element, render_context_t* context, render_state_t* state, float x, float y, float width, float height)
 {
-    if(state->mode == render_mode_bounding)
+    if(state->mode != render_mode_painting)
         return;
     plutovg_surface_t* image = load_image(element);
     if(image == NULL)
@@ -2521,14 +2635,14 @@ static void render_image(const element_t* element, render_context_t* context, re
     float _h = resolve_length(state, &h, 'y');
 
     render_state_t new_state;
-    render_state_begin(element, &new_state, state);
+    render_state_begin(element, context, &new_state, state);
 
     new_state.extents.x = _x;
     new_state.extents.y = _y;
     new_state.extents.w = _w;
     new_state.extents.h = _h;
     draw_image(element, context, &new_state, _x, _y, _w, _h);
-    render_state_end(&new_state);
+    render_state_end(context, &new_state);
 }
 
 static void render_element(const element_t* element, render_context_t* context, render_state_t* state)
@@ -2588,6 +2702,7 @@ bool plutosvg_document_render(const plutosvg_document_t* document, const char* i
     render_state_t state;
     state.parent = NULL;
     state.mode = render_mode_painting;
+    state.clipped = false;
     state.opacity = 1.f;
     state.extents = INVALID_RECT;
     state.view_width = document->width;
@@ -2603,7 +2718,7 @@ bool plutosvg_document_render(const plutosvg_document_t* document, const char* i
         state.element = element;
     }
 
-    render_context_t context = {document, canvas, current_color, palette_func, closure, 0};
+    render_context_t context = {document, canvas, current_color, palette_func, closure, 0, NULL, PLUTOVG_FILL_RULE_NON_ZERO};
     render_element(state.element, &context, &state);
     return true;
 }
@@ -2655,6 +2770,7 @@ bool plutosvg_document_extents(const plutosvg_document_t* document, const char* 
     render_state_t state;
     state.parent = NULL;
     state.mode = render_mode_bounding;
+    state.clipped = false;
     state.opacity = 1.f;
     state.extents = INVALID_RECT;
     state.view_width = document->width;
@@ -2673,7 +2789,7 @@ bool plutosvg_document_extents(const plutosvg_document_t* document, const char* 
         state.element = element;
     }
 
-    render_context_t context = {document, NULL, NULL, NULL, NULL, 0};
+    render_context_t context = {document, NULL, NULL, NULL, NULL, 0, NULL, PLUTOVG_FILL_RULE_NON_ZERO};
     render_element(state.element, &context, &state);
     if(IS_INVALID_RECT(state.extents)) {
         *extents = EMPTY_RECT;
